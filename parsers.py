@@ -344,7 +344,7 @@ def parse_ibi_transactions(text: str) -> dict:
 # ---------------------------------------------------------------------------
 # TASE EOD Prices
 # ---------------------------------------------------------------------------
-def parse_tase_eod(text: str) -> dict:
+def parse_tase_holdings(text: str) -> dict:
     """
     Parse TASE securityHistoryEOD.csv.
     Row 0: title e.g. "נתונים היסטוריים - סוף יום איביאי בית השק"

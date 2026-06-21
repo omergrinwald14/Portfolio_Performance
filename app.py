@@ -5,7 +5,6 @@ from parsers import (
     parse_ibkr_positions,
     parse_ibkr_transactions,
     parse_ibi_transactions,
-    parse_tase_eod,
     parse_tase_holdings,
 )
 
@@ -405,7 +404,7 @@ def upload_tase_eod():
     text, err = _read_file(request)
     if err:
         return jsonify({"error": err}), 400
-    r = parse_tase_eod(text)
+    r = parse_tase_holdings(text)
     return jsonify({
         "message": (
             f"{r['inserted']} prices for {r.get('ticker','?')} "
