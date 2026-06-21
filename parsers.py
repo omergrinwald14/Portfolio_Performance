@@ -37,19 +37,11 @@ EXCLUDED_IBI_FUNDS = {
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def parse_date(value, fmt=None) -> str | None:
+def parse_date(value) -> str | None:
     """Return YYYY-MM-DD string or None."""
     if not value:
         return None
     s = str(value).strip().strip('"')
-
-    # Handle explicit format if provided
-    if fmt:
-        try:
-            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            return None
-
     # YYYY-MM-DD
     if re.match(r"^\d{4}-\d{2}-\d{2}", s):
         return s[:10]
@@ -143,15 +135,12 @@ def parse_ibkr_positions(text: str) -> dict:
 
         try:
             c.execute(
-                """INSERT OR IGNORE INTO positions
+                """INSERT OR REPLACE INTO positions
                    (date, symbol, position_value_ils, fx_rate)
                    VALUES (?, ?, ?, ?)""",
                 (dt, symbol, value_ils, fx),
             )
-            if c.rowcount:
-                inserted += 1
-            else:
-                skipped += 1
+            inserted += 1
         except Exception:
             skipped += 1
 
@@ -212,44 +201,56 @@ def parse_ibkr_transactions(text: str) -> dict:
             key = (r["date"], r["symbol"])
             tax_map[key] = tax_map.get(key, 0.0) + r["net"]
 
-    # Second pass: build final transactions
+    # Second pass: combine all dividend/PIL rows for same date+symbol into ONE entry
+    # to avoid double-counting tax when multiple dividend types exist (e.g. ASO: Dividend + PIL)
     conn = get_db()
     c = conn.cursor()
     inserted = skipped = 0
 
+    # Aggregate dividend/PIL gross amounts per (date, symbol)
+    div_gross: dict[tuple, float] = {}
+    buy_sell = []
     for r in raw:
         if r["type"] == "tax":
             continue
-        tx_type = r["type"]
-        symbol  = r["symbol"]
-        dt      = r["date"]
+        if re.match(r"dividend|payment in lieu", r["type"], re.I):
+            key = (r["date"], r["symbol"])
+            div_gross[key] = div_gross.get(key, 0.0) + r["net"]
+        else:
+            buy_sell.append(r)
+
+    # Insert combined dividend rows (gross + total tax = net of withholding)
+    for (dt, symbol), gross in div_gross.items():
         if not dt:
             continue
+        tax = tax_map.get((dt, symbol), 0.0)
+        amount_ils = gross + tax
+        try:
+            c.execute(
+                """INSERT OR IGNORE INTO transactions
+                   (date, broker, tx_type, security, amount_ils)
+                   VALUES (?, 'IBKR', 'Dividend', ?, ?)""",
+                (dt, symbol, round(amount_ils, 4)),
+            )
+            inserted += (1 if c.rowcount else 0)
+            skipped  += (0 if c.rowcount else 1)
+        except Exception:
+            skipped += 1
 
-        is_dividend = bool(re.match(r"dividend|payment in lieu", tx_type, re.I))
-
-        if is_dividend:
-            tax = tax_map.get((dt, symbol), 0.0)
-            amount_ils = r["net"] + tax   # net + negative tax = net of withholding
-            tx_label = "Dividend"
-        elif re.match(r"buy", tx_type, re.I):
-            amount_ils = r["net"]
-            tx_label = "Buy"
-        else:
-            amount_ils = r["net"]
-            tx_label = "Sell"
-
+    # Insert buy/sell rows (net is already final ILS)
+    for r in buy_sell:
+        if not r["date"]:
+            continue
+        tx_label = "Buy" if re.match(r"buy", r["type"], re.I) else "Sell"
         try:
             c.execute(
                 """INSERT OR IGNORE INTO transactions
                    (date, broker, tx_type, security, amount_ils)
                    VALUES (?, 'IBKR', ?, ?, ?)""",
-                (dt, tx_label, symbol, round(amount_ils, 4)),
+                (r["date"], tx_label, r["symbol"], round(r["net"], 4)),
             )
-            if c.rowcount:
-                inserted += 1
-            else:
-                skipped += 1
+            inserted += (1 if c.rowcount else 0)
+            skipped  += (0 if c.rowcount else 1)
         except Exception:
             skipped += 1
 
@@ -341,53 +342,6 @@ def parse_ibi_transactions(text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# TASE Holdings (manual CSV: ticker, from_date, to_date, qty)
-# ---------------------------------------------------------------------------
-def parse_tase_holdings(text: str) -> dict:
-    """
-    Parse a user-maintained holdings CSV.
-    Columns: ticker, from_date, to_date (optional), qty
-    to_date defaults to '9999-12-31' (still holding).
-    Uses INSERT OR REPLACE so corrections via re-upload work correctly.
-    """
-    rows = read_csv_rows(text)
-    conn = get_db()
-    c = conn.cursor()
-    inserted = skipped = 0
-
-    for row in rows:
-        ticker    = row.get("ticker", "").strip()
-        from_date = parse_date(row.get("from_date", ""), fmt="%m/%d/%Y")
-        to_date   = parse_date(row.get("to_date", ""), fmt="%m/%d/%Y") or "9999-12-31"
-        qty_raw   = row.get("qty", "").strip()
-
-        if not ticker or not from_date or not qty_raw:
-            skipped += 1
-            continue
-
-        qty = to_float(qty_raw)
-        hebrew_name = TASE_ALIASES.get(ticker, "")
-
-        try:
-            c.execute(
-                """INSERT OR REPLACE INTO tase_holdings
-                   (ticker, hebrew_name, from_date, to_date, qty)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (ticker, hebrew_name, from_date, to_date, qty),
-            )
-            if c.rowcount:
-                inserted += 1
-            else:
-                skipped += 1
-        except Exception:
-            skipped += 1
-
-    conn.commit()
-    conn.close()
-    return {"inserted": inserted, "skipped": skipped}
-
-
-# ---------------------------------------------------------------------------
 # TASE EOD Prices
 # ---------------------------------------------------------------------------
 def parse_tase_eod(text: str) -> dict:
@@ -430,7 +384,7 @@ def parse_tase_eod(text: str) -> dict:
 
         try:
             c.execute(
-                """INSERT OR IGNORE INTO tase_prices
+                """INSERT OR REPLACE INTO tase_prices
                    (date, ticker, hebrew_name, price_ils)
                    VALUES (?, ?, ?, ?)""",
                 (dt, ticker, hebrew_name, price_ils),
