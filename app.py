@@ -503,5 +503,35 @@ def build_portfolio():
     conn.close()
     return jsonify({"message": f"Built {count} rows in daily_portfolio"})
 
+@app.route("/debug/ibi-value")
+def debug_ibi_value():
+    from database import get_db
+    date = request.args.get("date", "2023-09-11")
+    conn = get_db()
+    holdings = conn.execute("""
+        SELECT ticker, hebrew_name, from_date, to_date, qty
+        FROM tase_holdings
+        WHERE from_date <= ? AND to_date >= ?
+    """, (date, date)).fetchall()
+    
+    result = []
+    for h in holdings:
+        price_row = conn.execute("""
+            SELECT date, price_ils FROM tase_prices
+            WHERE ticker = ?
+            AND date = (SELECT MAX(date) FROM tase_prices WHERE ticker = ? AND date <= ?)
+        """, (h["ticker"], h["ticker"], date)).fetchone()
+        result.append({
+            "ticker": h["ticker"],
+            "qty": h["qty"],
+            "from_date": h["from_date"],
+            "to_date": h["to_date"],
+            "price_date": price_row["date"] if price_row else None,
+            "price_ils": price_row["price_ils"] if price_row else None,
+            "value": round(h["qty"] * price_row["price_ils"], 2) if price_row else 0
+        })
+    conn.close()
+    return jsonify({"date": date, "holdings": result})
+
 if __name__ == "__main__":
     app.run(debug=True, port=5000)

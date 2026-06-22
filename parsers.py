@@ -37,11 +37,16 @@ EXCLUDED_IBI_FUNDS = {
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def parse_date(value) -> str | None:
+def parse_date(value, fmt=None) -> str | None:
     """Return YYYY-MM-DD string or None."""
     if not value:
         return None
     s = str(value).strip().strip('"')
+    if fmt:
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
     # YYYY-MM-DD
     if re.match(r"^\d{4}-\d{2}-\d{2}", s):
         return s[:10]
@@ -344,30 +349,78 @@ def parse_ibi_transactions(text: str) -> dict:
 # ---------------------------------------------------------------------------
 # TASE EOD Prices
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# TASE Holdings (manual CSV: ticker, from_date, to_date, qty)
+# ---------------------------------------------------------------------------
 def parse_tase_holdings(text: str) -> dict:
+    """
+    Parse a user-maintained holdings CSV.
+    Columns: ticker, from_date, to_date (optional), qty
+    to_date defaults to '9999-12-31' (still holding).
+    """
+    rows = read_csv_rows(text)
+    conn = get_db()
+    c = conn.cursor()
+    inserted = skipped = 0
+
+    for row in rows:
+        ticker    = row.get("ticker", "").strip()
+        from_date = parse_date(row.get("from_date", ""), fmt="%m/%d/%Y")
+        to_date   = parse_date(row.get("to_date", ""), fmt="%m/%d/%Y") or "9999-12-31"
+        qty_raw   = row.get("qty", "").strip()
+
+        if not ticker or not from_date or not qty_raw:
+            skipped += 1
+            continue
+
+        qty = to_float(qty_raw)
+        hebrew_name = TASE_ALIASES.get(ticker, "")
+
+        try:
+            c.execute(
+                """INSERT OR REPLACE INTO tase_holdings
+                   (ticker, hebrew_name, from_date, to_date, qty)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (ticker, hebrew_name, from_date, to_date, qty),
+            )
+            if c.rowcount:
+                inserted += 1
+            else:
+                skipped += 1
+        except Exception as e:
+            print(f"[holdings] INSERT error: {e}")
+            skipped += 1
+
+    conn.commit()
+    conn.close()
+    return {"inserted": inserted, "skipped": skipped}
+
+
+# ---------------------------------------------------------------------------
+# TASE EOD Prices
+# ---------------------------------------------------------------------------
+def parse_tase_eod(text: str) -> dict:
     """
     Parse TASE securityHistoryEOD.csv.
     Row 0: title e.g. "נתונים היסטוריים - סוף יום איביאי בית השק"
     Row 1-2: metadata (skip)
     Row 3+: data — col0=date(DD/MM/YYYY), col3=price(agorot)
     Converts agorot → ILS (/100).
-    Auto-detects Hebrew name from title and maps to ticker via TASE_ALIASES_REV.
     """
     text = text.lstrip("\ufeff")
     lines = [l for l in text.replace("\r", "").split("\n") if l.strip()]
     if not lines:
         return {"inserted": 0, "skipped": 0}
 
-    # Extract Hebrew name from title row
     title_match = re.search(r"סוף יום (.+?)(?:,|$)", lines[0])
     hebrew_name = title_match.group(1).strip() if title_match else ""
-    ticker = TASE_ALIASES_REV.get(hebrew_name, hebrew_name)  # fall back to hebrew name
+    ticker = TASE_ALIASES_REV.get(hebrew_name, hebrew_name)
 
     conn = get_db()
     c = conn.cursor()
     inserted = skipped = 0
 
-    for line in lines[3:]:   # data starts at index 3
+    for line in lines[3:]:
         parts = line.split(",")
         if len(parts) < 4:
             continue
@@ -384,15 +437,20 @@ def parse_tase_holdings(text: str) -> dict:
 
         try:
             c.execute(
-                """INSERT OR REPLACE INTO tase_prices
+                """INSERT OR IGNORE INTO tase_prices
                    (date, ticker, hebrew_name, price_ils)
                    VALUES (?, ?, ?, ?)""",
                 (dt, ticker, hebrew_name, price_ils),
             )
-            inserted += 1
-        except Exception:
+            if c.rowcount:
+                inserted += 1
+            else:
+                skipped += 1
+        except Exception as e:
+            print(f"[tase_eod] INSERT error: {e}")
             skipped += 1
 
     conn.commit()
     conn.close()
     return {"inserted": inserted, "skipped": skipped, "ticker": ticker, "name": hebrew_name}
+
