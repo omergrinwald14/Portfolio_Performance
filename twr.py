@@ -25,7 +25,7 @@ def portfolio_value(date: str) -> dict:
     holdings = c.execute(
         """SELECT ticker, hebrew_name, qty
            FROM tase_holdings
-           WHERE from_date <= ? AND to_date >= ?""",
+           WHERE from_date <= ? AND to_date > ?""",
         (date, date)
     ).fetchall()
 
@@ -137,7 +137,7 @@ def build_daily_portfolio():
         conn = get_db()
         holdings = conn.execute("""
             SELECT ticker, qty FROM tase_holdings
-            WHERE from_date <= ? AND to_date >= ?
+            WHERE from_date <= ? AND to_date > ?
         """, (date, date)).fetchall()
         total = 0.0
         for h in holdings:

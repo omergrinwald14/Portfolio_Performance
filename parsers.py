@@ -449,7 +449,7 @@ def parse_tase_eod(text: str) -> dict:
         except Exception as e:
             print(f"[tase_eod] INSERT error: {e}")
             skipped += 1
-
+    
     conn.commit()
     conn.close()
     return {"inserted": inserted, "skipped": skipped, "ticker": ticker, "name": hebrew_name}

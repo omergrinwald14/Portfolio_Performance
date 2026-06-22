@@ -6,6 +6,7 @@ from parsers import (
     parse_ibkr_transactions,
     parse_ibi_transactions,
     parse_tase_holdings,
+    parse_tase_eod
 )
 
 
@@ -362,6 +363,7 @@ def _read_file(req):
     f = req.files["file"]
     if not f.filename:
         return None, "Empty filename"
+    f.seek(0)    
     try:
         return f.read().decode("utf-8-sig"), None
     except UnicodeDecodeError:
@@ -404,7 +406,7 @@ def upload_tase_eod():
     text, err = _read_file(request)
     if err:
         return jsonify({"error": err}), 400
-    r = parse_tase_holdings(text)
+    r = parse_tase_eod(text)
     return jsonify({
         "message": (
             f"{r['inserted']} prices for {r.get('ticker','?')} "
