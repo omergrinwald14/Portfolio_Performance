@@ -505,6 +505,7 @@ def build_portfolio():
     conn.close()
     return jsonify({"message": f"Built {count} rows in daily_portfolio"})
 
+
 @app.route("/debug/ibi-value")
 def debug_ibi_value():
     from database import get_db
@@ -534,6 +535,199 @@ def debug_ibi_value():
         })
     conn.close()
     return jsonify({"date": date, "holdings": result})
+
+
+TWR_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>TWR Chart</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0f1117; color: #e2e8f0;
+           font-family: 'Segoe UI', sans-serif; font-size: 14px; padding: 40px; }
+    h1   { font-size: 22px; color: #4ade80; margin-bottom: 4px; }
+    .sub { color: #64748b; margin-bottom: 28px; font-size: 13px; }
+    .controls { display: flex; gap: 16px; align-items: flex-end; margin-bottom: 24px; flex-wrap: wrap; }
+    .controls label { font-size: 12px; color: #94a3b8; display: flex; flex-direction: column; gap: 4px; }
+    .controls input[type=date] {
+      background: #1e2230; border: 1px solid #2e3450; color: #e2e8f0;
+      border-radius: 6px; padding: 7px 10px; font-size: 13px;
+    }
+    .go-btn {
+      background: #4ade80; color: #000; border: none; border-radius: 6px;
+      padding: 8px 20px; font-weight: 700; font-size: 13px; cursor: pointer;
+    }
+    .go-btn:hover { background: #86efac; }
+    .kpi-row { display: flex; gap: 20px; margin-bottom: 28px; flex-wrap: wrap; }
+    .kpi {
+      background: #1e2230; border: 1px solid #2e3450; border-radius: 10px;
+      padding: 16px 24px; min-width: 160px;
+    }
+    .kpi .label { font-size: 11px; color: #64748b; text-transform: uppercase;
+                   letter-spacing: .5px; margin-bottom: 6px; }
+    .kpi .value { font-size: 26px; font-weight: 700; color: #4ade80; }
+    .chart-wrap { background: #1e2230; border: 1px solid #2e3450;
+                   border-radius: 12px; padding: 24px; max-width: 960px; }
+    .err { color: #f87171; font-size: 13px; margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Portfolio TWR</h1>
+  <p class="sub">Time-Weighted Return · net of tax · ILS</p>
+
+  <div class="controls">
+    <label>Start date <input type="date" id="start" value="2022-07-13"></label>
+    <label>End date   <input type="date" id="end"   value="2026-06-11"></label>
+    <button class="go-btn" onclick="load()">Update</button>
+  </div>
+
+  <div class="kpi-row">
+    <div class="kpi"><div class="label">Total TWR</div><div class="value" id="kpi-twr">—</div></div>
+    <div class="kpi"><div class="label">CAGR</div>    <div class="value" id="kpi-cagr">—</div></div>
+    <div class="kpi"><div class="label">Period</div>  <div class="value" id="kpi-days" style="font-size:18px">—</div></div>
+  </div>
+
+  <div class="chart-wrap">
+    <canvas id="chart" height="320"></canvas>
+    <div class="err" id="err"></div>
+  </div>
+
+  <script>
+    let chartInstance = null;
+
+    function pct(v) { return (v * 100).toFixed(2) + '%'; }
+
+    async function load() {
+      const start = document.getElementById('start').value;
+      const end   = document.getElementById('end').value;
+      document.getElementById('err').textContent = '';
+
+      try {
+        const res  = await fetch(`/debug/twr?start_date=${start}&end_date=${end}`);
+        const data = await res.json();
+
+        const series = data.series || [];
+        if (!series.length) {
+          document.getElementById('err').textContent = 'No data for selected range.';
+          return;
+        }
+
+        // KPIs
+        const twr   = data.twr;
+        const days  = (new Date(end) - new Date(start)) / 86400000;
+        const years = days / 365.25;
+        const cagr  = Math.pow(1 + twr, 1 / years) - 1;
+
+        document.getElementById('kpi-twr').textContent  = pct(twr);
+        document.getElementById('kpi-cagr').textContent = pct(cagr);
+        document.getElementById('kpi-days').textContent = `${Math.round(days)}d / ${years.toFixed(1)}y`;
+
+        // Color KPIs red if negative
+        ['kpi-twr','kpi-cagr'].forEach(id => {
+          document.getElementById(id).style.color =
+            parseFloat(document.getElementById(id).textContent) < 0 ? '#f87171' : '#4ade80';
+        });
+
+        // Chart
+        const labels = series.map(r => r.date);
+        const values = series.map(r => +(r.cumulative_twr * 100).toFixed(4));
+
+        if (chartInstance) chartInstance.destroy();
+        chartInstance = new Chart(document.getElementById('chart'), {
+          type: 'line',
+          data: {
+            labels,
+            datasets: [{
+              label: 'Cumulative TWR (%)',
+              data: values,
+              borderColor: '#4ade80',
+              borderWidth: 2,
+              pointRadius: 0,
+              fill: true,
+              backgroundColor: 'rgba(74,222,128,0.07)',
+              tension: 0.3,
+            }]
+          },
+          options: {
+            responsive: true,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+              legend: { labels: { color: '#94a3b8' } },
+              tooltip: {
+                callbacks: {
+                  label: ctx => ` TWR: ${ctx.parsed.y.toFixed(2)}%`
+                }
+              }
+            },
+            scales: {
+              x: {
+                ticks: { color: '#64748b', maxTicksLimit: 12,
+                          callback: (_, i) => labels[i]?.slice(0,7) },
+                grid:  { color: '#1a1f2e' }
+              },
+              y: {
+                ticks: { color: '#64748b', callback: v => v + '%' },
+                grid:  { color: '#1a1f2e' }
+              }
+            }
+          }
+        });
+
+      } catch(e) {
+        document.getElementById('err').textContent = 'Error: ' + e.message;
+      }
+    }
+
+    load(); // auto-load on page open
+  </script>
+</body>
+</html>
+"""
+
+@app.route("/twr")
+def twr_page():
+    return render_template_string(TWR_HTML)
+
+
+@app.route("/debug/earliest")
+def debug_earliest():
+    from database import get_db
+    conn = get_db()
+    c = conn.cursor()
+    return jsonify({
+        "earliest_position": c.execute("SELECT MIN(date) FROM positions").fetchone()[0],
+        "earliest_transaction": c.execute("SELECT MIN(date) FROM transactions").fetchone()[0],
+        "earliest_tase_price": c.execute("SELECT MIN(date) FROM tase_prices").fetchone()[0],
+        "tx_dates": [r[0] for r in c.execute(
+            "SELECT DISTINCT date FROM transactions ORDER BY date LIMIT 20"
+        ).fetchall()],
+    })
+
+
+@app.route("/debug/first-tx-value")
+def debug_first_tx_value():
+    from database import get_db
+    conn = get_db()
+    c = conn.cursor()
+    date = "2022-07-13"
+    nearest = c.execute(
+        "SELECT MAX(date) FROM positions WHERE date <= ?", (date,)
+    ).fetchone()[0]
+    total = c.execute(
+        "SELECT SUM(position_value_ils) FROM positions WHERE date = ?", (nearest,)
+    ).fetchone()[0]
+    rows = c.execute(
+        "SELECT * FROM positions WHERE date = ?", (nearest,)
+    ).fetchall()
+    return jsonify({
+        "queried_date": date,
+        "nearest_position_date": nearest,
+        "total_value": total,
+        "rows": [dict(r) for r in rows]
+    })
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
