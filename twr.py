@@ -188,14 +188,15 @@ def build_daily_portfolio():
         open_val  = prev_close(date)
         close_val = ibkr_value_on(date) + ibi_value_on(date)
 
+
         conn.execute("""
-            INSERT OR REPLACE INTO daily_portfolio
+            INSERT INTO daily_portfolio
             (date, broker, name, type, cashflow, open_value, close_value)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (date, broker, name, tx_type,
-              round(cashflow, 4),
-              round(open_val, 2),
-              round(close_val, 2)))
+            round(cashflow, 4),
+            round(open_val, 2),
+            round(close_val, 2)))
         conn.commit()  # commit each row so prev_close can read it immediately
 
     conn.close()
