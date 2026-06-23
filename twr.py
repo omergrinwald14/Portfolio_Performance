@@ -111,64 +111,6 @@ def calculate_twr(start_date: str, end_date: str) -> dict:
     return {"twr": round(twr_multiplier - 1.0, 4), "series": series}
 
 # ---------------------------------------------------------------------------
-# MWR Calculation
-# ---------------------------------------------------------------------------
-
-def calculate_mwr(start_date: str, end_date: str) -> float:
-    """
-    IRR-based MWR over the period.
-    Cashflows: Buy = negative (money leaves pocket), Sell/Dividend = positive.
-    Terminal value (final portfolio close) = positive cashflow at end_date.
-    Returns annualized rate.
-    """
-    from scipy.optimize import brentq
-
-    conn = get_db()
-    c = conn.cursor()
-
-    tx_rows = c.execute("""
-        SELECT date, SUM(cashflow) AS net_cf
-        FROM daily_portfolio
-        WHERE date >= ? AND date <= ?
-        GROUP BY date
-        ORDER BY date
-    """, (start_date, end_date)).fetchall()
-
-    final = c.execute("""
-        SELECT MAX(close_value) FROM daily_portfolio
-        WHERE date = (SELECT MAX(date) FROM daily_portfolio WHERE date <= ?)
-    """, (end_date,)).fetchone()[0] or 0.0
-    conn.close()
-
-    if not tx_rows:
-        return 0.0
-
-    t0 = tx_rows[0]["date"]  # anchor date
-
-    cashflows = []
-    for row in tx_rows:
-        days = (
-            __import__("datetime").date.fromisoformat(row["date"]) -
-            __import__("datetime").date.fromisoformat(t0)
-        ).days
-        cashflows.append((days, float(row["net_cf"])))
-
-    # Terminal value at end_date
-    T = (__import__("datetime").date.fromisoformat(end_date) -
-         __import__("datetime").date.fromisoformat(t0)).days
-    cashflows.append((T, final))
-
-    def npv(r_daily):
-        return sum(cf / (1 + r_daily) ** t for t, cf in cashflows)
-
-    try:
-        r_daily = brentq(npv, -0.9999, 10.0, maxiter=1000)
-        r_annual = (1 + r_daily) ** 365 - 1
-        return round(r_annual, 6)
-    except ValueError:
-        return 0.0
-
-# ---------------------------------------------------------------------------
 # Build daily_portfolio
 # ---------------------------------------------------------------------------
 

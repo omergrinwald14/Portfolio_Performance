@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify, render_template_string, render_template
 from database import init_db, migrate_db
-from twr import calculate_twr
+from twr import calculate_twr, calculate_mwr
 from parsers import (
     parse_ibkr_positions,
     parse_ibkr_transactions,
@@ -691,43 +691,6 @@ TWR_HTML = """
 def twr_page():
     return render_template_string(TWR_HTML)
 
-
-@app.route("/debug/earliest")
-def debug_earliest():
-    from database import get_db
-    conn = get_db()
-    c = conn.cursor()
-    return jsonify({
-        "earliest_position": c.execute("SELECT MIN(date) FROM positions").fetchone()[0],
-        "earliest_transaction": c.execute("SELECT MIN(date) FROM transactions").fetchone()[0],
-        "earliest_tase_price": c.execute("SELECT MIN(date) FROM tase_prices").fetchone()[0],
-        "tx_dates": [r[0] for r in c.execute(
-            "SELECT DISTINCT date FROM transactions ORDER BY date LIMIT 20"
-        ).fetchall()],
-    })
-
-
-@app.route("/debug/first-tx-value")
-def debug_first_tx_value():
-    from database import get_db
-    conn = get_db()
-    c = conn.cursor()
-    date = "2022-07-13"
-    nearest = c.execute(
-        "SELECT MAX(date) FROM positions WHERE date <= ?", (date,)
-    ).fetchone()[0]
-    total = c.execute(
-        "SELECT SUM(position_value_ils) FROM positions WHERE date = ?", (nearest,)
-    ).fetchone()[0]
-    rows = c.execute(
-        "SELECT * FROM positions WHERE date = ?", (nearest,)
-    ).fetchall()
-    return jsonify({
-        "queried_date": date,
-        "nearest_position_date": nearest,
-        "total_value": total,
-        "rows": [dict(r) for r in rows]
-    })
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
