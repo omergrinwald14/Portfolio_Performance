@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify, render_template_string, render_template
 from database import init_db, migrate_db
-from twr import calculate_twr, calculate_mwr
+from twr import calculate_twr
 from parsers import (
     parse_ibkr_positions,
     parse_ibkr_transactions,
@@ -71,7 +71,13 @@ UPLOAD_HTML = """
            font-family: 'Segoe UI', sans-serif; font-size: 14px; padding: 40px; }
     h1  { font-size: 22px; color: #4ade80; margin-bottom: 4px; }
     .sub { color: #64748b; margin-bottom: 32px; font-size: 13px; }
-
+    .nav-btn {
+      display: inline-block; margin-bottom: 28px;
+      background: #1e2230; color: #4ade80; border: 1px solid #4ade80;
+      border-radius: 6px; padding: 8px 18px; font-weight: 700;
+      font-size: 13px; text-decoration: none;
+    }
+    .nav-btn:hover { background: rgba(74,222,128,.1); }
     /* Drop zone */
     .dropzone {
       border: 2px dashed #2e3450; border-radius: 12px;
@@ -145,7 +151,7 @@ UPLOAD_HTML = """
 <body>
   <h1>TWR Portfolio App</h1>
   <p class="sub">Drop any files — auto-sorted by type and uploaded to the database</p>
-
+  <a class="nav-btn" href="/twr">View TWR</a>
   <!-- Drop zone -->
   <div class="dropzone" id="dropzone"
        ondragover="onDragOver(event)" ondragleave="onDragLeave()"
@@ -163,7 +169,12 @@ UPLOAD_HTML = """
          onchange="addFiles(this.files)">
 
   <!-- Queue -->
-  <div id="file-list" class="file-list"></div>
+  <div id="file-list-wrap">
+    <div id="file-list" class="file-list"></div>
+  </div>
+  <div id="collapse-bar" style="display:none; max-width:860px; margin-bottom:12px;">
+    <button class="refresh-btn" onclick="toggleList()" id="collapse-btn">▼ Show details</button>
+  </div>
   <button class="upload-all-btn" id="upload-btn"
           onclick="uploadAll()" disabled>⚡ Upload All</button>
 
@@ -220,6 +231,7 @@ UPLOAD_HTML = """
           queue.push({ file, type, id });
           renderRow(file.name, type, id, 'pending', '');
           document.getElementById('upload-btn').disabled = false;
+          collapseList();
         };
         reader.readAsText(file);
       });
@@ -299,6 +311,29 @@ UPLOAD_HTML = """
       queue = [];
       btn.textContent = '⚡ Upload All';
       loadStatus();
+      collapseList();
+    }
+
+    let listCollapsed = false;
+
+    function collapseList() {
+      document.getElementById('file-list').style.display = 'none';
+      document.getElementById('collapse-bar').style.display = 'block';
+      document.getElementById('collapse-btn').textContent = '▼ Show upload details';
+      listCollapsed = true;
+    }
+
+    function toggleList() {
+      const list = document.getElementById('file-list');
+      if (listCollapsed) {
+        list.style.display = 'flex';
+        document.getElementById('collapse-btn').textContent = '▲ Hide upload details';
+        listCollapsed = false;
+      } else {
+        list.style.display = 'none';
+        document.getElementById('collapse-btn').textContent = '▼ Show upload details';
+        listCollapsed = true;
+      }
     }
 
     async function loadStatus() {
@@ -577,7 +612,6 @@ TWR_HTML = """
 <body>
   <h1>Portfolio TWR</h1>
   <p class="sub">Time-Weighted Return · net of tax · ILS</p>
-
   <div class="controls">
     <label>Start date <input type="date" id="start" value="2022-07-13"></label>
     <label>End date   <input type="date" id="end"   value="2026-06-11"></label>
