@@ -1,6 +1,16 @@
-from flask import Flask, request, jsonify, render_template_string, render_template
-from database import init_db, migrate_db
-from twr import calculate_twr
+"""
+app.py — Flask web server and API for the TWR Portfolio App.
+"""
+
+import logging
+from contextlib import closing
+from typing import Tuple, Optional
+
+from flask import Flask, request, jsonify, render_template_string, Request
+from werkzeug.datastructures import FileStorage
+
+from database import get_db, init_db, migrate_db
+from twr import calculate_twr, build_daily_portfolio
 from parsers import (
     parse_ibkr_positions,
     parse_ibkr_transactions,
@@ -9,56 +19,20 @@ from parsers import (
     parse_tase_eod
 )
 
+# Configure basic logging
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 app = Flask(__name__)
+
+# Initialize database schemas
 init_db()
 migrate_db()
 
-# ---------------------------------------------------------------------------
-# Auto-classify a file by sniffing its content
-# Returns one of: 'ibkr-positions' | 'ibkr-transactions' | 'ibi-transactions'
-#                 'tase-eod' | None
-# ---------------------------------------------------------------------------
-def classify_file(text: str, filename: str) -> str | None:
-    sample = text[:800]
-    fname  = filename.lower()
-
-    if "שער נעילה" in sample:
-        return "tase-eod"
-    if "תאריך" in sample and "סוג" in sample:
-        return "ibi-transactions"
-    if "ReportDate" in sample and "PositionValue" in sample:
-        return "ibkr-positions"
-    if "Transaction History" in sample:
-        return "ibkr-transactions"
-    if "ticker" in sample and "from_date" in sample:
-        return "tase-holdings"
-
-    # Filename fallbacks
-    if "position" in fname or "portfolio" in fname:
-        return "ibkr-positions"
-    if "eod" in fname or "history" in fname:
-        return "tase-eod"
-    if any(x in fname for x in ["ibi", "broker2", "hebrew"]):
-        return "ibi-transactions"
-    if any(x in fname for x in ["transaction", "activity"]):
-        return "ibkr-transactions"
-    if "holdings" in fname:
-        return "tase-holdings"
-
-    return None
-
-
-LABEL = {
-    "ibkr-positions":    "IBKR Positions",
-    "ibkr-transactions": "IBKR Transactions",
-    "ibi-transactions":  "IBI Transactions",
-    "tase-eod":          "TASE EOD Prices",
-}
 
 # ---------------------------------------------------------------------------
-# Upload page — single drop zone, auto-sorts files
+# Frontend HTML Templates
 # ---------------------------------------------------------------------------
+
 UPLOAD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -152,7 +126,7 @@ UPLOAD_HTML = """
   <h1>TWR Portfolio App</h1>
   <p class="sub">Drop any files — auto-sorted by type and uploaded to the database</p>
   <a class="nav-btn" href="/twr">View TWR</a>
-  <!-- Drop zone -->
+  
   <div class="dropzone" id="dropzone"
        ondragover="onDragOver(event)" ondragleave="onDragLeave()"
        ondrop="onDrop(event)" onclick="document.getElementById('file-input').click()">
@@ -168,7 +142,6 @@ UPLOAD_HTML = """
   <input type="file" id="file-input" multiple accept=".csv"
          onchange="addFiles(this.files)">
 
-  <!-- Queue -->
   <div id="file-list-wrap">
     <div id="file-list" class="file-list"></div>
   </div>
@@ -194,17 +167,16 @@ UPLOAD_HTML = """
       'ibkr-transactions': 'badge-ibkr-tx',
       'ibi-transactions':  'badge-ibi-tx',
       'tase-eod':          'badge-tase',
-      'tase-holdings':    'badge-tase',
+      'tase-holdings':     'badge-tase',
     };
     const BADGE_LABEL = {
       'ibkr-positions':    'IBKR Positions',
       'ibkr-transactions': 'IBKR Transactions',
       'ibi-transactions':  'IBI Transactions',
       'tase-eod':          'TASE EOD Prices',
-      'tase-holdings':    'TASE Holdings',
+      'tase-holdings':     'TASE Holdings',
     };
 
-    // queue: [{file, type, rowId}]
     let queue = [];
     let rowCounter = 0;
 
@@ -237,7 +209,6 @@ UPLOAD_HTML = """
       });
     }
 
-    // Client-side classifier (mirrors server logic)
     function classifyClient(text, filename) {
       const s = text.slice(0, 800);
       const f = filename.toLowerCase();
@@ -348,6 +319,7 @@ UPLOAD_HTML = """
         document.getElementById('db-status').textContent = 'Could not load status';
       }
     }
+
     async function resetDB() {
       if (!confirm('Delete ALL data from the database? This cannot be undone.')) return;
       const btn = document.getElementById('reset-btn');
@@ -364,6 +336,7 @@ UPLOAD_HTML = """
         btn.textContent = '🗑 Reset DB';
       }
     }
+
     async function buildPortfolio() {
       const btn = document.getElementById('build-btn');
       btn.disabled = true;
@@ -385,192 +358,6 @@ UPLOAD_HTML = """
 </body>
 </html>
 """
-
-
-@app.route("/")
-def index():
-    return render_template_string(UPLOAD_HTML)
-
-
-def _read_file(req):
-    if "file" not in req.files:
-        return None, "No file provided"
-    f = req.files["file"]
-    if not f.filename:
-        return None, "Empty filename"
-    f.seek(0)    
-    try:
-        return f.read().decode("utf-8-sig"), None
-    except UnicodeDecodeError:
-        f.seek(0)
-        try:
-            return f.read().decode("windows-1255"), None
-        except Exception as e:
-            return None, str(e)
-
-
-@app.route("/upload/ibkr-positions", methods=["POST"])
-def upload_ibkr_positions():
-    text, err = _read_file(request)
-    if err:
-        return jsonify({"error": err}), 400
-    r = parse_ibkr_positions(text)
-    return jsonify({"message": f"{r['inserted']} rows inserted, {r['skipped']} skipped", **r})
-
-
-@app.route("/upload/ibkr-transactions", methods=["POST"])
-def upload_ibkr_transactions():
-    text, err = _read_file(request)
-    if err:
-        return jsonify({"error": err}), 400
-    r = parse_ibkr_transactions(text)
-    return jsonify({"message": f"{r['inserted']} transactions inserted, {r['skipped']} skipped", **r})
-
-
-@app.route("/upload/ibi-transactions", methods=["POST"])
-def upload_ibi_transactions():
-    text, err = _read_file(request)
-    if err:
-        return jsonify({"error": err}), 400
-    r = parse_ibi_transactions(text)
-    return jsonify({"message": f"{r['inserted']} transactions inserted, {r['skipped']} skipped", **r})
-
-
-@app.route("/upload/tase-eod", methods=["POST"])
-def upload_tase_eod():
-    text, err = _read_file(request)
-    if err:
-        return jsonify({"error": err}), 400
-    r = parse_tase_eod(text)
-    return jsonify({
-        "message": (
-            f"{r['inserted']} prices for {r.get('ticker','?')} "
-            f"({r.get('name','')}) · {r['skipped']} skipped"
-        ),
-        **r,
-    })
-
-
-@app.route("/upload/tase-holdings", methods=["POST"])
-def upload_tase_holdings():
-    text, err = _read_file(request)
-    if err:
-        return jsonify({"error": err}), 400
-    r = parse_tase_holdings(text)
-    return jsonify({"message": f"{r['inserted']} holdings inserted, {r['skipped']} skipped", **r})
-
-
-@app.route("/reset", methods=["POST"])
-def reset_db():
-    from database import get_db
-    conn = get_db()
-    c = conn.cursor()
-    for table in ["positions", "transactions", "tase_prices", "tase_holdings"]:
-        c.execute(f"DELETE FROM {table}")
-    conn.commit()
-    conn.close()
-    return jsonify({"message": "All tables cleared."})
-
-
-@app.route("/debug/positions")
-def debug_positions():
-    from database import get_db
-    conn = get_db()
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT date, symbol, position_value_ils, fx_rate FROM positions ORDER BY date DESC LIMIT 20"
-    ).fetchall()
-    conn.close()
-    return jsonify([dict(r) for r in rows])
-
-
-@app.route("/debug/transactions")
-def debug_transactions():
-    from database import get_db
-    conn = get_db()
-    c = conn.cursor()
-    rows = c.execute(
-        """SELECT date, broker, tx_type, security, amount_ils
-           FROM transactions
-           ORDER BY date DESC, broker, security"""
-    ).fetchall()
-    conn.close()
-    return jsonify([dict(r) for r in rows])
-
-
-@app.route("/debug/value")
-def debug_value():
-    from twr import portfolio_value
-    date = request.args.get("date")
-    if not date:
-        return jsonify({"error": "Pass ?date=YYYY-MM-DD"}), 400
-    result = portfolio_value(date)
-    return jsonify(result)
-
-
-@app.route("/status")
-def status():
-    from database import get_db
-    conn = get_db()
-    c = conn.cursor()
-    counts = {
-        "positions":    c.execute("SELECT COUNT(*) FROM positions").fetchone()[0],
-        "transactions": c.execute("SELECT COUNT(*) FROM transactions").fetchone()[0],
-        "tase_prices":  c.execute("SELECT COUNT(*) FROM tase_prices").fetchone()[0],
-    }
-    conn.close()
-    return jsonify(counts)
-
-@app.route('/debug/twr')
-def debug_twr():
-    start_date = request.args.get('start_date', '2022-07-13')
-    end_date = request.args.get('end_date', '2026-06-11')
-    result = calculate_twr(start_date, end_date)
-    return jsonify(result)
-
-
-@app.route("/build", methods=["POST"])
-def build_portfolio():
-    from twr import build_daily_portfolio
-    from database import get_db
-    build_daily_portfolio()
-    conn = get_db()
-    c = conn.cursor()
-    count = c.execute("SELECT COUNT(*) FROM daily_portfolio").fetchone()[0]
-    conn.close()
-    return jsonify({"message": f"Built {count} rows in daily_portfolio"})
-
-
-@app.route("/debug/ibi-value")
-def debug_ibi_value():
-    from database import get_db
-    date = request.args.get("date", "2023-09-11")
-    conn = get_db()
-    holdings = conn.execute("""
-        SELECT ticker, hebrew_name, from_date, to_date, qty
-        FROM tase_holdings
-        WHERE from_date <= ? AND to_date >= ?
-    """, (date, date)).fetchall()
-    
-    result = []
-    for h in holdings:
-        price_row = conn.execute("""
-            SELECT date, price_ils FROM tase_prices
-            WHERE ticker = ?
-            AND date = (SELECT MAX(date) FROM tase_prices WHERE ticker = ? AND date <= ?)
-        """, (h["ticker"], h["ticker"], date)).fetchone()
-        result.append({
-            "ticker": h["ticker"],
-            "qty": h["qty"],
-            "from_date": h["from_date"],
-            "to_date": h["to_date"],
-            "price_date": price_row["date"] if price_row else None,
-            "price_ils": price_row["price_ils"] if price_row else None,
-            "value": round(h["qty"] * price_row["price_ils"], 2) if price_row else 0
-        })
-    conn.close()
-    return jsonify({"date": date, "holdings": result})
-
 
 TWR_HTML = """
 <!DOCTYPE html>
@@ -640,7 +427,7 @@ TWR_HTML = """
       document.getElementById('err').textContent = '';
 
       try {
-        const res  = await fetch(`/debug/twr?start_date=${start}&end_date=${end}`);
+        const res  = await fetch(`/api/twr?start_date=${start}&end_date=${end}`);
         const data = await res.json();
 
         const series = data.series || [];
@@ -659,7 +446,6 @@ TWR_HTML = """
         document.getElementById('kpi-cagr').textContent = pct(cagr);
         document.getElementById('kpi-days').textContent = `${Math.round(days)}d / ${years.toFixed(1)}y`;
 
-        // Color KPIs red if negative
         ['kpi-twr','kpi-cagr'].forEach(id => {
           document.getElementById(id).style.color =
             parseFloat(document.getElementById(id).textContent) < 0 ? '#f87171' : '#4ade80';
@@ -715,15 +501,157 @@ TWR_HTML = """
       }
     }
 
-    load(); // auto-load on page open
+    load(); 
   </script>
 </body>
 </html>
 """
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _read_file(req: Request) -> Tuple[Optional[str], Optional[str]]:
+    """Extract and securely decode a CSV file from the Flask request."""
+    if "file" not in req.files:
+        return None, "No file provided in the request."
+        
+    f: FileStorage = req.files["file"]
+    if not f.filename:
+        return None, "Empty filename provided."
+        
+    f.seek(0)
+    try:
+        return f.read().decode("utf-8-sig"), None
+    except UnicodeDecodeError:
+        f.seek(0)
+        try:
+            return f.read().decode("windows-1255"), None
+        except Exception as e:
+            logging.error(f"Failed to decode file {f.filename}: {e}")
+            return None, f"Decoding failed: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# View Routes
+# ---------------------------------------------------------------------------
+
+@app.route("/")
+def index():
+    """Render the main upload dashboard."""
+    return render_template_string(UPLOAD_HTML)
+
+
 @app.route("/twr")
 def twr_page():
+    """Render the Time-Weighted Return charting page."""
     return render_template_string(TWR_HTML)
+
+
+# ---------------------------------------------------------------------------
+# API Upload Routes
+# ---------------------------------------------------------------------------
+
+@app.route("/upload/ibkr-positions", methods=["POST"])
+def upload_ibkr_positions():
+    """Endpoint for uploading IBKR position CSVs."""
+    text, err = _read_file(request)
+    if err:
+        return jsonify({"error": err}), 400
+    r = parse_ibkr_positions(text)
+    return jsonify({"message": f"{r['inserted']} rows inserted, {r['skipped']} skipped", **r})
+
+
+@app.route("/upload/ibkr-transactions", methods=["POST"])
+def upload_ibkr_transactions():
+    """Endpoint for uploading IBKR transaction CSVs."""
+    text, err = _read_file(request)
+    if err:
+        return jsonify({"error": err}), 400
+    r = parse_ibkr_transactions(text)
+    return jsonify({"message": f"{r['inserted']} transactions inserted, {r['skipped']} skipped", **r})
+
+
+@app.route("/upload/ibi-transactions", methods=["POST"])
+def upload_ibi_transactions():
+    """Endpoint for uploading IBI transaction CSVs."""
+    text, err = _read_file(request)
+    if err:
+        return jsonify({"error": err}), 400
+    r = parse_ibi_transactions(text)
+    return jsonify({"message": f"{r['inserted']} transactions inserted, {r['skipped']} skipped", **r})
+
+
+@app.route("/upload/tase-eod", methods=["POST"])
+def upload_tase_eod():
+    """Endpoint for uploading TASE End-of-Day prices."""
+    text, err = _read_file(request)
+    if err:
+        return jsonify({"error": err}), 400
+    r = parse_tase_eod(text)
+    return jsonify({
+        "message": (
+            f"{r['inserted']} prices for {r.get('ticker','?')} "
+            f"({r.get('name','')}) · {r['skipped']} skipped"
+        ),
+        **r,
+    })
+
+
+@app.route("/upload/tase-holdings", methods=["POST"])
+def upload_tase_holdings():
+    """Endpoint for uploading manual TASE holding records."""
+    text, err = _read_file(request)
+    if err:
+        return jsonify({"error": err}), 400
+    r = parse_tase_holdings(text)
+    return jsonify({"message": f"{r['inserted']} holdings inserted, {r['skipped']} skipped", **r})
+
+
+# ---------------------------------------------------------------------------
+# API Action Routes
+# ---------------------------------------------------------------------------
+
+@app.route("/reset", methods=["POST"])
+def reset_db():
+    """Wipe all portfolio and transaction data from the database."""
+    with closing(get_db()) as conn:
+        with conn:
+            c = conn.cursor()
+            for table in ["positions", "transactions", "tase_prices", "tase_holdings", "daily_portfolio"]:
+                c.execute(f"DELETE FROM {table}")
+    return jsonify({"message": "All tables cleared successfully."})
+
+
+@app.route("/build", methods=["POST"])
+def build_portfolio():
+    """Rebuild the daily_portfolio timeline from imported records."""
+    build_daily_portfolio()
+    with closing(get_db()) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM daily_portfolio").fetchone()[0]
+    return jsonify({"message": f"Built {count} rows in daily_portfolio"})
+
+
+@app.route("/status")
+def status():
+    """Fetch row counts to display on the dashboard."""
+    with closing(get_db()) as conn:
+        counts = {
+            "positions":    conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0],
+            "transactions": conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0],
+            "tase_prices":  conn.execute("SELECT COUNT(*) FROM tase_prices").fetchone()[0],
+        }
+    return jsonify(counts)
+
+
+@app.route('/api/twr')
+def api_twr():
+    """Fetch cumulative TWR series data for charting."""
+    start_date = request.args.get('start_date', '2022-07-13')
+    end_date = request.args.get('end_date', '2026-06-11')
+    result = calculate_twr(start_date, end_date)
+    return jsonify(result)
 
 
 if __name__ == "__main__":
